@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Smile → Emoji (fixed permissions handling)</title>
+  <style>
+    :root{--bg:#0f1113;--card:#0b0b0b;--accent:#00FF99}
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:var(--bg);color:#eee;display:flex;flex-direction:column;align-items:center;gap:12px;min-height:100vh;padding:18px}
+    .stage{position:relative;width:720px;max-width:95vw;background:#000;border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,0.04)}
+    video{display:block;width:100%;height:auto;background:#111}
+    canvas{position:absolute;left:0;top:0;pointer-events:none}
+    .controls{display:flex;gap:8px;align-items:center}
+    button{padding:8px 12px;border-radius:6px;border:0;background:#1f1f1f;color:#fff;cursor:pointer}
+    button[disabled]{opacity:0.5;cursor:default}
+    #emoji{position:absolute;font-size:64px;transform:translate(-50%,-50%);pointer-events:none;filter:drop-shadow(0 6px 12px rgba(0,0,0,0.7));display:none}
+    #status{font-size:14px;opacity:0.95;margin-left:6px}
+    footer{margin-top:8px;font-size:13px;color:#bbb}
+    .help{max-width:720px;max-width:95vw;color:#ccc;font-size:13px;line-height:1.4}
+    .hint{background:#071217;border-left:4px solid var(--accent);padding:10px;border-radius:6px;margin-top:8px}
+  </style>
+</head>
+<body>
+  <h2>Smile → Emoji</h2>
+  <div class="controls">
+    <button id="startBtn">Start camera & detection</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="retryPermBtn" hidden>Try request permission</button>
+    <div id="status">Ready</div>
+  </div>
+
+  <div class="stage" id="stage">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+    <div id="emoji">🙂</div>
+  </div>
+
+  <div class="help">
+    <div id="helpText">This page uses <code>getUserMedia()</code> and face-api.js to detect facial expressions and map them to emoji.</div>
+    <div class="hint" id="hintBox">Tip: If you see a <strong>permission denied</strong> error, please run this page from <em>https://</em> or <em>http://localhost</em>, and make sure the browser has camera permission for this site. See the status messages above for details.</div>
+  </div>
+
+  <footer>If you run this from the filesystem (file://) or an insecure server, many browsers will block camera access. Use localhost or serve over HTTPS.</footer>
+
+  <!-- face-api.js from CDN -->
+  <script defer src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
+  <script>
+    // --- Configuration ---
+    const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models'; // public hosted models (you can also host locally)
+    const VIDEO = document.getElementById('video');
+    const OVERLAY = document.getElementById('overlay');
+    const EMOJI = document.getElementById('emoji');
+    const STATUS = document.getElementById('status');
+    const HELP = document.getElementById('helpText');
+    const HINT = document.getElementById('hintBox');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const retryPermBtn = document.getElementById('retryPermBtn');
+
+    let stream = null;
+    let detectionInterval = null;
+    let modelsLoaded = false;
+
+    // map face-api expression names to emoji
+    const EMOJI_MAP = {
+      happy: '😄',
+      surprised: '😲',
+      angry: '😠',
+      sad: '😢',
+      neutral: '🙂',
+      disgusted: '🤢',
+      fearful: '😱'
+    };
+
+    function isSecureContextForCamera() {
+      // Browsers typically block camera access on non-secure contexts (file://, http://) except localhost
+      return location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.hostname.startsWith('192.168.') || location.hostname === '';
+    }
+
+    async function checkCameraDeviceExists() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return false;
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        return devices.some(d => d.kind === 'videoinput');
+      } catch (e) {
+        return false;
+      }
+    }
+
+    async function tryQueryPermission() {
+      if (!navigator.permissions) return 'unknown';
+      try {
+        // Some browsers support name: 'camera', others may not — wrap safely.
+        const status = await navigator.permissions.query({ name: 'camera' });
+        return status.state; // 'granted' | 'denied' | 'prompt'
+      } catch (e) {
+        return 'unknown';
+      }
+    }
+
+    async function loadModels() {
+      if (modelsLoaded) return;
+      STATUS.textContent = 'Loading models...';
+      try {
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+          faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL)
+        ]);
+        modelsLoaded = true;
+        STATUS.textContent = 'Models loaded — ready';
+      } catch (e) {
+        console.error('Model load failed', e);
+        STATUS.textContent = 'Model load failed (check network or host models locally)';
+      }
+    }
+
+    function setOverlaySize() {
+      // Set canvas intrinsic size to the video intrinsic size, but keep CSS size equal to displayed size
+      OVERLAY.width = VIDEO.videoWidth || 640;
+      OVERLAY.height = VIDEO.videoHeight || 480;
+      OVERLAY.style.width = VIDEO.clientWidth + 'px';
+      OVERLAY.style.height = VIDEO.clientHeight + 'px';
+    }
+
+    VIDEO.addEventListener('loadedmetadata', () => setOverlaySize());
+    window.addEventListener('resize', () => setOverlaySize());
+
+    async function startCamera() {
+      // Prevent unnecessary permission prompts if page is clearly insecure
+      if (!isSecureContextForCamera()) {
+        STATUS.textContent = 'Blocked: page not served over HTTPS or localhost. Serve over HTTPS or open via localhost to use the camera.';
+        HINT.innerText = 'Run the page from https:// or http://localhost: e.g. use `npx http-server` and open http://localhost:8080, or deploy via HTTPS.';
+        return;
+      }
+
+      const hasCamera = await checkCameraDeviceExists();
+      if (!hasCamera) {
+        STATUS.textContent = 'No camera devices found on this machine.';
+        HINT.innerText = 'Make sure your laptop/desktop has a camera, or plug in a USB webcam.';
+        return;
+      }
+
+      // load models first (if not already)
+      await loadModels();
+      if (!modelsLoaded) return; // model load failed
+
+      try {
+        STATUS.textContent = 'Requesting camera permission...';
+        startBtn.disabled = true;
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+        VIDEO.srcObject = stream;
+        await VIDEO.play();
+        setOverlaySize();
+
+        detectionInterval = setInterval(detectFace, 120);
+        STATUS.textContent = 'Detecting...';
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        retryPermBtn.hidden = true;
+      } catch (err) {
+        console.error('getUserMedia error', err);
+        startBtn.disabled = false;
+
+        if (err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || err.name === 'SecurityError')) {
+          STATUS.textContent = 'Permission denied: camera access blocked.';
+          HINT.innerHTML = `Possible fixes:<br>
+            1) Allow camera permission in the browser for this site (site settings).<br>
+            2) Use <strong>https://</strong> or <strong>localhost</strong> (many browsers block camera on file:// or http://).<br>
+            3) Close other apps that may be using the camera.`;
+          retryPermBtn.hidden = false;
+        } else if (err && err.name === 'NotFoundError') {
+          STATUS.textContent = 'No camera found (NotFoundError).';
+        } else {
+          STATUS.textContent = 'Camera error: ' + (err && err.message ? err.message : String(err));
+        }
+      }
+    }
+
+    async function stopCamera() {
+      if (detectionInterval) { clearInterval(detectionInterval); detectionInterval = null; }
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      VIDEO.pause();
+      VIDEO.srcObject = null;
+      EMOJI.style.display = 'none';
+      STATUS.textContent = 'Stopped';
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      retryPermBtn.hidden = true;
+    }
+
+    async function detectFace() {
+      try {
+        if (VIDEO.readyState < 2) return; // not enough data
+        const options = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 });
+        const result = await faceapi.detectSingleFace(VIDEO, options).withFaceLandmarks().withFaceExpressions();
+        const ctx = OVERLAY.getContext('2d');
+        ctx.clearRect(0, 0, OVERLAY.width, OVERLAY.height);
+
+        if (!result) {
+          EMOJI.style.display = 'none';
+          return;
+        }
+
+        // draw bounding box
+        const resized = faceapi.resizeResults(result, { width: OVERLAY.width, height: OVERLAY.height });
+        const box = resized.detection.box;
+        ctx.strokeStyle = '--accent';
+        ctx.strokeStyle = '#00FF99';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(box.x, box.y, box.width, box.height);
+
+        // pick top expression
+        const expressions = resized.expressions;
+        const best = Object.entries(expressions).sort((a, b) => b[1] - a[1])[0];
+        const [name, score] = best || ['neutral', 0];
+
+        // mouth center
+        const mouth = resized.landmarks.getMouth();
+        let mx = mouth.reduce((s, p) => s + p.x, 0) / mouth.length;
+        let my = mouth.reduce((s, p) => s + p.y, 0) / mouth.length;
+
+        // position emoji relative to overlay (CSS pixels)
+        const overlayRect = OVERLAY.getBoundingClientRect();
+        const cssLeft = (mx / OVERLAY.width) * overlayRect.width;
+        const cssTop = (my / OVERLAY.height) * overlayRect.height;
+
+        EMOJI.style.left = cssLeft + 'px';
+        EMOJI.style.top = cssTop + 'px';
+        EMOJI.style.display = 'block';
+        EMOJI.textContent = EMOJI_MAP[name] || '🙂';
+
+        // label
+        ctx.fillStyle = '#00FF99';
+        ctx.font = '16px system-ui';
+        const labelY = box.y > 20 ? box.y - 8 : box.y + box.height + 18;
+        ctx.fillText(`${name} (${(score * 100).toFixed(0)}%)`, box.x, labelY);
+      } catch (e) {
+        // minor errors during detection shouldn't crash the whole app
+        console.error('detectFace error', e);
+      }
+    }
+
+    // wire buttons
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true;
+      // quick permission query for helpful UX (best-effort)
+      const p = await tryQueryPermission();
+      if (p === 'denied') {
+        STATUS.textContent = 'Camera permission already denied. Please enable it in site settings and try again.';
+        retryPermBtn.hidden = false;
+        startBtn.disabled = false;
+        return;
+      }
+
+      try {
+        await startCamera();
+      } catch (e) {
+        console.error('startCamera threw', e);
+        STATUS.textContent = 'Start failed: ' + (e.message || e.name || e);
+        startBtn.disabled = false;
+      }
+    });
+
+    stopBtn.addEventListener('click', stopCamera);
+    retryPermBtn.addEventListener('click', async () => {
+      // Re-request permission. Some browsers may still block without user action in settings.
+      STATUS.textContent = 'Requesting permission again...';
+      try {
+        await navigator.mediaDevices.getUserMedia({ video: true });
+        STATUS.textContent = 'Permission granted — click Start to begin.';
+        retryPermBtn.hidden = true;
+      } catch (err) {
+        console.error('retry permission error', err);
+        STATUS.textContent = 'Permission still denied: ' + (err.name || err.message || err);
+      }
+    });
+
+    // helpful note: when running locally from the filesystem, some browsers block model fetches and camera access.
+
+    // Autofocus: load models so the page is responsive without waiting for Start if the page is secure.
+    (async () => {
+      if (isSecureContextForCamera()) {
+        await loadModels();
+      } else {
+        STATUS.textContent = 'Page insecure: models and camera will load after you fix HTTPS/localhost.';
+      }
+    })();
+  </script>
+</body>
+</html>
